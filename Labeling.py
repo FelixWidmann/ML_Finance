@@ -5,6 +5,38 @@ import numpy as np
 import pandas as pd
 from typing import List
 
+#Function that returns the number of Trading Days of a Event
+def count_trading_days_per_event(
+    trading_days: pd.DatetimeIndex,
+    event_start: pd.Series | np.ndarray,
+    event_end: pd.Series | np.ndarray,
+) -> np.ndarray:
+    """
+    Count number of trading days between event_start and event_end for each event.
+
+    trading_days: sorted DatetimeIndex of valid trading days
+    event_start, event_end: same length, datetime-like (Series or array)
+    """
+    # Make sure these are arrays of Timestamps
+    start_vals = pd.to_datetime(event_start).to_numpy()
+    end_vals   = pd.to_datetime(event_end).to_numpy()
+
+    # Position of first trading day >= start
+    start_idx = trading_days.searchsorted(start_vals, side="left")
+
+    # Position of last trading day <= end
+    end_idx = trading_days.searchsorted(end_vals, side="right") - 1
+
+    # Clip to valid range in case start/end are outside trading_days
+    start_idx = np.clip(start_idx, 0, len(trading_days) - 1)
+    end_idx   = np.clip(end_idx,   0, len(trading_days) - 1)
+
+    # Number of trading days (if end before start, set to 0)
+    n_days = end_idx - start_idx + 1
+    n_days = np.where(n_days < 0, 0, n_days)
+
+    return n_days
+
 
 def cusum_filter_events_dynamic_threshold(
         prices: pd.Series,
@@ -76,7 +108,7 @@ def vertical_barrier(
     number_days: int
 ) -> pd.Series:
     """
-    Shows one way to define a vertical barrier.
+    Define a vertical barrier.
 
     :param close: A dataframe of prices and dates.
     :param time_events: A vector of timestamps.
@@ -95,30 +127,35 @@ def triple_barrier(
     profit_taking_stop_loss: list[float, float],
     molecule: list
 ) -> pd.DataFrame:
+    
     # Filter molecule to ensure all timestamps exist in events
     molecule = [m for m in molecule if m in events.index]
 
-    # Continue with the existing logic
+    # Continue filtered Events
     events_filtered = events.loc[molecule]
     output = events_filtered[['End Time']].copy(deep=True)
 
+    # If profit Taking is set compute Level based on volatility scaled Base Width
     if profit_taking_stop_loss[0] > 0:
         profit_taking = profit_taking_stop_loss[0] * events_filtered['Base Width']
     else:
         profit_taking = pd.Series(index=events.index)
 
+    # If Stop Loss is set compute Level based on volatility scaled Base Width
     if profit_taking_stop_loss[1] > 0:
         stop_loss = -profit_taking_stop_loss[1] * events_filtered['Base Width']
     else:
         stop_loss = pd.Series(index=events.index)
 
+    #determine earliest time where stop loss, profit taking or vertical barrier is hit
     for location, timestamp in events_filtered['End Time'].fillna(close.index[-1]).items():
-        df = close[location:timestamp]
+        df = close[location:timestamp] #takes the price path from start to the vertical barrier:
         df = np.log(df / close[location]) * events_filtered.at[location, 'Side']
-        output.loc[location, 'stop_loss'] = df[df < stop_loss[location]].index.min()
-        output.loc[location, 'profit_taking'] = df[df > profit_taking[location]].index.min()
+        output.loc[location, 'stop_loss'] = df[df < stop_loss[location]].index.min()#earliest time where stop loss is hit within vertical time horizon
+        output.loc[location, 'profit_taking'] = df[df > profit_taking[location]].index.min()#earliest time where profit taking is hit within vertical time horizon
 
     return output
+
 
 def meta_events(
     close: pd.Series,
@@ -130,6 +167,7 @@ def meta_events(
     timestamp: pd.Series = False,
     side: pd.Series = None
 ) -> pd.DataFrame:
+    
     # Filter target by time_events and return_min
     target = target.loc[time_events]
     target = target[target > return_min]
@@ -138,16 +176,20 @@ def meta_events(
     if timestamp is False:
         timestamp = pd.Series(pd.NaT, index=time_events)
     else:
+        #set timestamps to events start date.
         timestamp = timestamp.loc[time_events]
 
     if side is None:
+        #if none. side_position is filled entirely with one, so we always go long at every event.
+        #both profit and loss barrier is set to the same value.
         side_position, profit_loss = pd.Series(1., index=target.index), [ptsl[0], ptsl[0]]
     else:
+        #if side is set then side_position is either 1 for long or -1 for short. 
+        #profit and loss barrier is set to the same value.
         side_position, profit_loss = side.loc[target.index], ptsl[:2]
 
     # Include 'target' and 'timestamp' in the events DataFrame
     events = pd.concat({'End Time': timestamp, 'Base Width': target, 'Side': side_position, 'target': target, 'timestamp': timestamp}, axis=1).dropna(subset=['Base Width'])
-
 
     df0 = list(map(
         triple_barrier,
@@ -158,6 +200,7 @@ def meta_events(
     ))
     df0 = pd.concat(df0, axis=0)
 
+    #set End Time to earliest barrier hit.
     events['End Time'] = df0.dropna(how='all').min(axis=1)
 
     if side is None:
@@ -165,6 +208,84 @@ def meta_events(
 
     # Return events including the 'target' and 'timestamp' columns
     return events , df0
+
+
+
+def triple_barrier_labeling(
+    events: pd.DataFrame,
+    close: pd.Series,
+    return_min: float | None = None,
+    three_class: bool = True,
+) -> pd.DataFrame:
+    """
+    Label events by the sign of the realized return at End Time, with an
+    optional threshold on the absolute return.
+
+    Parameters
+    ----------
+    events : DataFrame
+        Must contain at least 'End Time' and 'timestamp' columns, and be
+        indexed by the event start time.
+    close : Series
+        Price series indexed by timestamps.
+    return_min : float or None
+        If not None, events with |return| < return_min get label 0 (if
+        three_class=True) or are left in the DataFrame with Side=0 so you
+        can filter them out later.
+    three_class : bool
+        If True: Side ∈ {-1, 0, 1} (small returns → 0).
+        If False: Side ∈ {-1, 1} and you can manually drop small-return
+        events when training.
+
+    Returns
+    -------
+    out : DataFrame
+        Index = events_filtered.index
+        Columns: ['timestamp', 'End Time', 'Return', 'Side', 'trade_days', 'Daily_Return']
+    """
+    # Drop events without a valid End Time
+    events_filtered = events.dropna(subset=['End Time'])
+
+    # Align close series
+    all_dates = events_filtered.index.union(events_filtered['End Time'].values).drop_duplicates()
+    close_filtered = close.reindex(all_dates, method='bfill')
+
+    # Start and end prices
+    start_prices = close_filtered.loc[events_filtered.index].values
+    end_prices = close_filtered.loc[events_filtered['End Time'].values].values
+
+    # Realized return
+    ret = end_prices / start_prices - 1
+
+    out = pd.DataFrame(index = events_filtered.index)
+    out['timestamp'] = events_filtered.index
+    out['End Time'] = events_filtered['End Time']
+    out['Return'] = ret
+
+    #compute Number of Trading Days of the Event and Daily Return.
+    trading_days = close.index.unique()
+    n_days = count_trading_days_per_event(
+        trading_days = trading_days,
+        event_start  = events_filtered.index,
+        event_end    = events_filtered["End Time"],
+    )
+    out["trade_days"] = n_days
+    out["Daily_Return"] = np.where(n_days > 0, ret / n_days, 0.0)
+
+    # Base label: sign of return
+    side = np.sign(ret)
+
+    if return_min is not None:
+        small = np.abs(ret) < return_min
+        if three_class:
+            # Small moves -> label 0
+            side[small] = 0
+        else:
+            pass
+
+    out['Side'] = side
+
+    return out
 
 
 def meta_labeling(
@@ -186,14 +307,20 @@ def meta_labeling(
     all_dates = events_filtered.index.union(events_filtered['End Time'].values).drop_duplicates()
     close_filtered = close.reindex(all_dates, method='bfill')
     out = pd.DataFrame(index=events_filtered.index)
-    out['End Time'] = events['End Time']
+    
+    #time of first barrier hit
+    #Return of Label: close price at end time/ close price at start time - 1.
     out['Return of Label'] = close_filtered.loc[events_filtered['End Time'].values].values / close_filtered.loc[events_filtered.index] - 1
 
-    if 'Side' in events_filtered:
-        out['Return of Label'] *= events_filtered['Side']
+    #timestamp contains original vertical barrier dates per event. The equality returns zero if unequal so pt or sl
+    # is hit or 1 if vertical barrier is hit. So Label = 1 if a barrier is hit and 0 if vertical barrier is hit.    
+    if 'pred_Side' in events_filtered:
+        out['Return of Label'] *= events_filtered['pred_Side']
+    
     out['Label'] = np.sign(out['Return of Label'])  * (1 - (events['End Time'] == events['timestamp']))
-    if 'Side' in events_filtered:
+    
+    if 'pred_Side' in events_filtered:
         out.loc[out['Return of Label'] <= 0, 'Label'] = 0
-        out['Side'] = events_filtered['Side']
+        #out['Side'] = events_filtered['Side']
     return out
 
