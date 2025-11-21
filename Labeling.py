@@ -290,7 +290,8 @@ def triple_barrier_labeling(
 
 def meta_labeling(
     events: pd.DataFrame,
-    close: pd.Series
+    close: pd.Series,
+    threshold = 0.4
 ) -> pd.DataFrame:
     """
     Expands label to incorporate meta-labeling.
@@ -321,6 +322,9 @@ def meta_labeling(
     
     if 'pred_Side' in events_filtered:
         out.loc[out['Return of Label'] <= 0, 'Label'] = 0
-        #out['Side'] = events_filtered['Side']
+
+    if 'pred_Side_proba' in events_filtered:
+        out.loc[events_filtered['pred_Side_proba'] <= threshold, 'Label'] = 0
+
     return out
 
