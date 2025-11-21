@@ -222,10 +222,10 @@ def meta_labeling(
 
     #timestamp contains original vertical barrier dates per event. The equality returns zero if unequal so pt or sl
     # is hit or 1 if vertical barrier is hit. So Label = 1 if a barrier is hit and 0 if vertical barrier is hit.    
-    if 'Side' in events_filtered:
-        out['Return of Label'] *= events_filtered['Side']
+    if 'pred_Side' in events_filtered:
+        out['Return of Label'] *= events_filtered['pred_Side']
     out['Label'] = np.sign(out['Return of Label'])  * (1 - (events['End Time'] == events['timestamp']))
-    if 'Side' in events_filtered:
+    if 'pred_Side' in events_filtered:
         out.loc[out['Return of Label'] <= 0, 'Label'] = 0
         #out['Side'] = events_filtered['Side']
     return out
